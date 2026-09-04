@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+requests
+python-docx
+youtube-transcript-api
+mangum
