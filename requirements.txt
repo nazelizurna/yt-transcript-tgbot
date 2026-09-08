@@ -2,5 +2,5 @@ fastapi
 uvicorn
 requests
 python-docx
-yt-dlp
+yt-dlp[default]
 mangum
