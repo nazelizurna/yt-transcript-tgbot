@@ -33,7 +33,7 @@ YOUTUBE_ID_PATTERNS = [
 ]
 
 
-def extract_video_id(text: str) -> Optional[str]:
+def extract_video_id(text: str) -> ional[str]:
     if not text:
         return None
     for pattern in YOUTUBE_ID_PATTERNS:
@@ -134,13 +134,14 @@ def fetch_transcript(video_id: str) -> Optional[list]:
         import yt_dlp
 
         url = f"https://www.youtube.com/watch?v={video_id}"
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "writeautomaticsub": True,
-            "writesubtitles": True,
-        }
+       ydl_opts = {
+    "quiet": False,
+    "no_warnings": False,
+    "verbose": True,
+    "skip_download": True,
+    "writeautomaticsub": True,
+    "writesubtitles": True,
+}
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
