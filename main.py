@@ -99,18 +99,28 @@ def fetch_transcript(video_id: str) -> Optional[list]:
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
 
-        transcript = YouTubeTranscriptApi().fetch(video_id)
+        api = YouTubeTranscriptApi()
+
+        # First try a broad set of common languages (fast path, no extra network call).
+        common_languages = [
+            "en", "en-US", "en-GB", "ru", "fr", "zh-Hans", "zh-Hant", "it",
+        ]
+        try:
+            transcript = api.fetch(video_id, languages=common_languages)
+        except Exception:
+            # Fall back: list whatever transcripts exist for this video and
+            # grab the first one available, in ANY language.
+            transcript_list = api.list(video_id)
+            first_available = next(iter(transcript_list))
+            transcript = first_available.fetch()
 
         return [
-            {
-                "start": segment.start,
-                "text": segment.text
-            }
+            {"start": segment.start, "text": segment.text}
             for segment in transcript
         ]
 
-    except Exception as e:
-        logger.exception(f"Transcript fetch failed for {video_id}: {e}")
+    except Exception:
+        logger.error(f"Transcript fetch failed for {video_id}:\n{traceback.format_exc()}")
         return None
 
 
