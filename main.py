@@ -1,25 +1,13 @@
 """
 YouTube Transcript -> Telegram Document Bot (Webhook Architecture)
 ====================================================================
-Deploy target: Render (native ASGI) or Vercel (via Mangum adapter, see notes at bottom).
-
-Env vars required:
-    TELEGRAM_BOT_TOKEN   - token from @BotFather
-    WEBHOOK_SECRET       - (optional but recommended) random string used as the
-                            URL path segment so randos on the internet can't POST to your bot
-
-Dependencies (requirements.txt):
-    fastapi
-    uvicorn
-    requests
-    python-docx
-    mangum          # only needed for Vercel deployment
 """
 
 import os
 import re
 import tempfile
 import logging
+import traceback
 from typing import Optional
 
 import requests
@@ -33,12 +21,9 @@ logger = logging.getLogger("yt-transcript-bot")
 app = FastAPI()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")  # empty string = no secret check
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}"
 
-# ---------------------------------------------------------------------------
-# 3.2  URL Parsing & Regular Expressions
-# ---------------------------------------------------------------------------
 YOUTUBE_ID_PATTERNS = [
     r"(?:youtube\.com/watch\?v=)([A-Za-z0-9_-]{11})",
     r"(?:youtube\.com/shorts/)([A-Za-z0-9_-]{11})",
@@ -49,7 +34,6 @@ YOUTUBE_ID_PATTERNS = [
 
 
 def extract_video_id(text: str) -> Optional[str]:
-    """Return the 11-char YouTube video ID from a URL, or None if not found."""
     if not text:
         return None
     for pattern in YOUTUBE_ID_PATTERNS:
@@ -59,25 +43,25 @@ def extract_video_id(text: str) -> Optional[str]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Telegram helpers (raw requests, no wrapper framework)
-# ---------------------------------------------------------------------------
 def tg_call(method: str, **kwargs):
-    """Generic Telegram Bot API call. Raises on missing token per spec 4."""
     if not TELEGRAM_BOT_TOKEN:
-        # Spec 4: missing token -> safe 500
-        raise HTTPException(status_code=500, detail="TELEGRAM_BOT_TOKEN not configured")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not configured")
     url = f"{TELEGRAM_API_BASE.format(token=TELEGRAM_BOT_TOKEN)}/{method}"
     files = kwargs.pop("files", None)
     resp = requests.post(url, data=kwargs, files=files, timeout=30)
+    if not resp.ok:
+        logger.error(f"Telegram API {method} failed: {resp.status_code} {resp.text}")
     resp.raise_for_status()
     return resp.json()
 
 
-def send_message(chat_id: int, text: str) -> int:
-    """Send a text message, return its message_id."""
-    result = tg_call("sendMessage", chat_id=chat_id, text=text)
-    return result["result"]["message_id"]
+def send_message(chat_id: int, text: str) -> Optional[int]:
+    try:
+        result = tg_call("sendMessage", chat_id=chat_id, text=text)
+        return result["result"]["message_id"]
+    except Exception:
+        logger.error(f"send_message failed:\n{traceback.format_exc()}")
+        return None
 
 
 def delete_message(chat_id: int, message_id: int) -> None:
@@ -92,41 +76,123 @@ def send_document(chat_id: int, file_path: str, caption: str) -> None:
         tg_call("sendDocument", chat_id=chat_id, caption=caption, files={"document": f})
 
 
-# ---------------------------------------------------------------------------
-# 3.3  Transcript retrieval
-# ---------------------------------------------------------------------------
+def _parse_vtt(vtt_text: str) -> list:
+    """Parse a WEBVTT subtitle file into [{start, text}, ...] segments."""
+    segments = []
+    time_pattern = re.compile(r"(\d{2}:\d{2}:\d{2}\.\d{3}) --> ")
+    tag_pattern = re.compile(r"<[^>]+>")
+
+    current_start = None
+    current_text_lines = []
+
+    def flush():
+        if current_start is not None and current_text_lines:
+            text = " ".join(current_text_lines).strip()
+            text = tag_pattern.sub("", text)
+            if text:
+                segments.append({"start": current_start, "text": text})
+
+    for line in vtt_text.splitlines():
+        match = time_pattern.match(line)
+        if match:
+            flush()
+            h, m, s = match.group(1).split(":")
+            current_start = int(h) * 3600 + int(m) * 60 + float(s)
+            current_text_lines = []
+        elif (
+            line.strip()
+            and not line.strip().isdigit()
+            and "WEBVTT" not in line
+            and "-->" not in line
+        ):
+            current_text_lines.append(line.strip())
+    flush()
+    return segments
+
+
+def _parse_json3(data: dict) -> list:
+    """Parse YouTube's json3 caption format into [{start, text}, ...] segments."""
+    segments = []
+    for event in data.get("events", []):
+        if "segs" not in event:
+            continue
+        start = event.get("tStartMs", 0) / 1000.0
+        text = "".join(seg.get("utf8", "") for seg in event["segs"]).strip()
+        if text:
+            segments.append({"start": start, "text": text})
+    return segments
+
+
 def fetch_transcript(video_id: str) -> Optional[list]:
+    """
+    Uses yt-dlp (instead of youtube_transcript_api) to pull captions.
+    yt-dlp hits YouTube's innertube API rather than scraping the watch-page
+    HTML directly, which tends to be more resilient to the IP-blocking that
+    cloud providers (Render, AWS, etc.) run into with simpler scrapers.
+    """
     try:
-        from youtube_transcript_api import YouTubeTranscriptApi
+        import yt_dlp
 
-        api = YouTubeTranscriptApi()
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "writeautomaticsub": True,
+            "writesubtitles": True,
+        }
 
-        # First try a broad set of common languages (fast path, no extra network call).
-        common_languages = [
-            "en", "en-US", "en-GB", "ru", "fr", "zh-Hans", "zh-Hant", "it",
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        manual_subs = info.get("subtitles") or {}
+        auto_subs = info.get("automatic_captions") or {}
+
+        preferred_langs = [
+            "en", "en-US", "en-GB", "ru", "es", "pt", "fr", "de",
+            "hi", "id", "ar", "ja", "ko", "zh-Hans", "zh-Hant", "it", "tr", "vi",
         ]
-        try:
-            transcript = api.fetch(video_id, languages=common_languages)
-        except Exception:
-            # Fall back: list whatever transcripts exist for this video and
-            # grab the first one available, in ANY language.
-            transcript_list = api.list(video_id)
-            first_available = next(iter(transcript_list))
-            transcript = first_available.fetch()
 
-        return [
-            {"start": segment.start, "text": segment.text}
-            for segment in transcript
-        ]
+        track_list = None
+        for lang in preferred_langs:
+            if lang in manual_subs:
+                track_list = manual_subs[lang]
+                break
+        if track_list is None:
+            for lang in preferred_langs:
+                if lang in auto_subs:
+                    track_list = auto_subs[lang]
+                    break
+        if track_list is None:
+            combined = {**auto_subs, **manual_subs}
+            if combined:
+                track_list = next(iter(combined.values()))
+
+        if not track_list:
+            logger.error(f"No caption tracks found for {video_id}")
+            return None
+
+        fmt_entry = next((f for f in track_list if f.get("ext") == "json3"), None)
+        if fmt_entry is None:
+            fmt_entry = next(
+                (f for f in track_list if f.get("ext") == "vtt"), track_list[0]
+            )
+
+        resp = requests.get(fmt_entry["url"], timeout=30)
+        resp.raise_for_status()
+
+        if fmt_entry.get("ext") == "json3":
+            segments = _parse_json3(resp.json())
+        else:
+            segments = _parse_vtt(resp.text)
+
+        return segments or None
 
     except Exception:
         logger.error(f"Transcript fetch failed for {video_id}:\n{traceback.format_exc()}")
         return None
 
 
-# ---------------------------------------------------------------------------
-# 3.4  Document generation
-# ---------------------------------------------------------------------------
 def format_timestamp(seconds: float) -> str:
     total = int(seconds)
     h, rem = divmod(total, 3600)
@@ -154,13 +220,10 @@ def build_docx(video_id: str, segments: list) -> str:
     return path
 
 
-# ---------------------------------------------------------------------------
-# Core flow (3.1)
-# ---------------------------------------------------------------------------
 def process_update(update: dict) -> None:
     message = update.get("message") or update.get("edited_message")
     if not message:
-        return  # ignore non-message updates (e.g. callback_query)
+        return
 
     chat_id = message["chat"]["id"]
     text = message.get("text", "")
@@ -170,42 +233,49 @@ def process_update(update: dict) -> None:
         send_message(chat_id, "❌ Please send a valid YouTube link.")
         return
 
-    status_id = send_message(chat_id, "⏳ Hook triggered! Extracting video transcript...")
+    status_id = send_message(chat_id, "⏳ Extracting video transcript...")
 
     file_path = None
     try:
         segments = fetch_transcript(video_id)
         if not segments:
-            send_message(chat_id, "❌ Transcript unavailable for this video context.")
+            send_message(chat_id, "❌ Transcript unavailable for this video.")
             return
 
         file_path = build_docx(video_id, segments)
         send_document(chat_id, file_path, caption=f"📄 File ready for Video ID: {video_id}")
+    except Exception:
+        logger.error(f"process_update failed for video {video_id}:\n{traceback.format_exc()}")
+        send_message(chat_id, "❌ Something went wrong generating your transcript.")
     finally:
-        delete_message(chat_id, status_id)
+        if status_id:
+            delete_message(chat_id, status_id)
         if file_path and os.path.exists(file_path):
-            os.remove(file_path)  # 5. Data Isolation - purge temp file
+            os.remove(file_path)
 
 
-# ---------------------------------------------------------------------------
-# Webhook endpoint
-# ---------------------------------------------------------------------------
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
+    # Never 500 on webhook secret mismatch checks or config issues —
+    # always return 200 so Telegram doesn't hammer retries, and log everything.
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+        logger.warning(f"Rejected webhook call with bad secret: {secret}")
+        return {"ok": True}
 
     if not TELEGRAM_BOT_TOKEN:
-        raise HTTPException(status_code=500, detail="TELEGRAM_BOT_TOKEN not configured")
+        logger.error("TELEGRAM_BOT_TOKEN is NOT SET in this environment — check Render Environment tab.")
+        return {"ok": True}
 
-    update = await request.json()
+    try:
+        update = await request.json()
+    except Exception:
+        logger.error(f"Failed to parse incoming update as JSON:\n{traceback.format_exc()}")
+        return {"ok": True}
+
     try:
         process_update(update)
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Don't let a bad update crash the webhook — log and 200 back to Telegram
-        logger.exception(f"Error processing update: {e}")
+    except Exception:
+        logger.error(f"Unhandled error in process_update:\n{traceback.format_exc()}")
 
     return {"ok": True}
 
@@ -215,30 +285,16 @@ async def health_check():
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
-# Local dev entrypoint (Render uses this via `uvicorn main:app`)
-# ---------------------------------------------------------------------------
+@app.get("/debug")
+async def debug():
+    """Temporary: confirms whether env vars are actually loaded in this deployment."""
+    return {
+        "token_set": bool(TELEGRAM_BOT_TOKEN),
+        "token_length": len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0,
+        "webhook_secret_set": bool(WEBHOOK_SECRET),
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
-
-
-# ---------------------------------------------------------------------------
-# VERCEL NOTE
-# ---------------------------------------------------------------------------
-# Vercel's Python runtime expects an ASGI-compatible `handler`. Add this to a
-# separate file (e.g. api/index.py) instead of running uvicorn directly:
-#
-#   from mangum import Mangum
-#   from main import app
-#   handler = Mangum(app)
-#
-# And a vercel.json routing all traffic to that file:
-#   {
-#     "builds": [{"src": "api/index.py", "use": "@vercel/python"}],
-#     "routes": [{"src": "/(.*)", "dest": "api/index.py"}]
-#   }
-#
-# Render is simpler: just set the start command to
-#   uvicorn main:app --host 0.0.0.0 --port $PORT
-# and it works with the file as-is (no Mangum needed).
