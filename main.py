@@ -96,22 +96,21 @@ def send_document(chat_id: int, file_path: str, caption: str) -> None:
 # 3.3  Transcript retrieval
 # ---------------------------------------------------------------------------
 def fetch_transcript(video_id: str) -> Optional[list]:
-    """
-    Fetch transcript segments for a video.
-
-    NOTE: The tech spec names a hypothetical free endpoint
-    (youtube-transcript.ai/<id>). That exact API does not reliably exist as a
-    stable public service, so this uses the `youtube-transcript-api` PyPI
-    package instead, which implements the same data contract:
-    a list of {"start": float, "text": str} dicts. Swap this function's body
-    for a `requests.get()` call if you have a specific endpoint/key to use.
-    """
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        raw = YouTubeTranscriptApi.get_transcript(video_id)
-        return [{"start": seg["start"], "text": seg["text"]} for seg in raw]
+
+        transcript = YouTubeTranscriptApi().fetch(video_id)
+
+        return [
+            {
+                "start": segment.start,
+                "text": segment.text
+            }
+            for segment in transcript
+        ]
+
     except Exception as e:
-        logger.info(f"Transcript fetch failed for {video_id}: {e}")
+        logger.exception(f"Transcript fetch failed for {video_id}: {e}")
         return None
 
 
