@@ -8,7 +8,7 @@ from typing import Optional
 import requests
 from fastapi import FastAPI, Request, HTTPException
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -161,6 +161,33 @@ def _parse_json3(data: dict) -> list:
     return segments
 
 
+# --- Video metadata (title) ------------------------------------------------
+
+def fetch_video_title(video_id: str) -> str:
+    """
+    Fetch the video's title via YouTube's public oEmbed endpoint (no API key
+    required). Returns whatever title YouTube reports for the video - for
+    Russian-language videos this is normally already in Russian. Falls back
+    to a generic placeholder if the lookup fails for any reason.
+    """
+    try:
+        resp = requests.get(
+            "https://www.youtube.com/oembed",
+            params={
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "format": "json",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        title = resp.json().get("title")
+        if title:
+            return title.strip()
+    except Exception:
+        logger.warning(f"Could not fetch title for {video_id}:\n{traceback.format_exc()}")
+    return f"Видео {video_id}"
+
+
 # --- Transcript sources ------------------------------------------------
 
 def fetch_transcript_rapidapi(video_id: str, lang: str = DEFAULT_LANG) -> Optional[list]:
@@ -188,6 +215,11 @@ def fetch_transcript_rapidapi(video_id: str, lang: str = DEFAULT_LANG) -> Option
         resp.raise_for_status()
         data = resp.json()
 
+        # --- TEMP DEBUG ---
+        logger.info(f"RapidAPI raw response keys: {list(data.keys())}")
+        logger.info(f"RapidAPI response size: {len(resp.text)} chars")
+        # ------------------
+
         # Supadata's response shape: {"lang": "en", "content": [{"text","offset","duration"}, ...]}
         raw_segments = data.get("content") or data.get("transcript") or []
         if not raw_segments:
@@ -198,6 +230,13 @@ def fetch_transcript_rapidapi(video_id: str, lang: str = DEFAULT_LANG) -> Option
             for seg in raw_segments
             if seg.get("text")
         ]
+
+        # --- TEMP DEBUG ---
+        total_chars = sum(len(s["text"]) for s in segments)
+        last_ts = segments[-1]["start"] if segments else 0
+        logger.info(f"Parsed {len(segments)} segments, {total_chars} total chars, last timestamp {last_ts:.1f}s")
+        # ------------------
+
         return segments or None
 
     except Exception:
@@ -301,12 +340,6 @@ def format_timestamp(seconds: float) -> str:
     return f"[{m:02d}:{s:02d}]"
 
 
-from docx.shared import Pt, Inches
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-
-
 def _add_page_number_field(paragraph):
     """Insert a PAGE field (auto page number) into a paragraph run."""
     run = paragraph.add_run()
@@ -325,7 +358,7 @@ def _add_page_number_field(paragraph):
     run._r.append(fldChar2)
 
 
-def build_docx(video_id: str, segments: list) -> str:
+def build_docx(video_id: str, segments: list, video_title: str) -> str:
     doc = Document()
 
     # 0.5" margins all around
@@ -356,16 +389,24 @@ def build_docx(video_id: str, segments: list) -> str:
     rFonts.set(qn('w:hAnsi'), 'Times New Roman')
     rFonts.set(qn('w:eastAsia'), 'Times New Roman')
 
-    doc.add_heading(f"YouTube Transcript - Video {video_id}", level=1)
+    # Title line (centered, bold) - the real (Russian) video title, replacing
+    # the old "YouTube Transcript - Video ..." heading.
+    title_para = doc.add_paragraph()
+    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_run = title_para.add_run(video_title)
+    title_run.font.name = "Times New Roman"
+    title_run.font.size = Pt(14)
+    title_run.bold = True
 
-    # No timestamps, no line breaks: join everything into one continuous paragraph
+    # Transcript body: one continuous paragraph, centered, no timestamps/line breaks
     full_text = " ".join(seg["text"].strip() for seg in segments if seg.get("text"))
     full_text = re.sub(r"\s+", " ", full_text).strip()
 
-    p = doc.add_paragraph()
-    run = p.add_run(full_text)
-    run.font.name = "Times New Roman"
-    run.font.size = Pt(14)
+    body_para = doc.add_paragraph()
+    body_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    body_run = body_para.add_run(full_text)
+    body_run.font.name = "Times New Roman"
+    body_run.font.size = Pt(14)
 
     fd, path = tempfile.mkstemp(suffix=".docx", dir="/tmp", prefix=f"{video_id}_")
     os.close(fd)
@@ -396,7 +437,8 @@ def process_update(update: dict) -> None:
             send_message(chat_id, "❌ Transcript unavailable for this video.")
             return
 
-        file_path = build_docx(video_id, segments)
+        video_title = fetch_video_title(video_id)
+        file_path = build_docx(video_id, segments, video_title)
         send_document(chat_id, file_path, caption=f"📄 File ready for Video ID: {video_id} ({lang})")
     except Exception:
         logger.error(f"process_update failed for video {video_id}:\n{traceback.format_exc()}")
@@ -406,49 +448,6 @@ def process_update(update: dict) -> None:
             delete_message(chat_id, status_id)
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
-
-
-
-def fetch_transcript_rapidapi(video_id: str, lang: str = DEFAULT_LANG) -> Optional[list]:
-    if not RAPIDAPI_KEY:
-        return None
-    try:
-        resp = requests.get(
-            RAPIDAPI_URL,
-            headers={"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST},
-            params={"url": f"https://www.youtube.com/watch?v={video_id}", "lang": lang},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        # --- TEMP DEBUG ---
-        logger.info(f"RapidAPI raw response keys: {list(data.keys())}")
-        logger.info(f"RapidAPI response size: {len(resp.text)} chars")
-        # ------------------
-
-        raw_segments = data.get("content") or data.get("transcript") or []
-        if not raw_segments:
-            return None
-
-        segments = [
-            {"start": seg["offset"] / 1000.0, "text": seg["text"]}
-            for seg in raw_segments
-            if seg.get("text")
-        ]
-
-        # --- TEMP DEBUG ---
-        total_chars = sum(len(s["text"]) for s in segments)
-        last_ts = segments[-1]["start"] if segments else 0
-        logger.info(f"Parsed {len(segments)} segments, {total_chars} total chars, last timestamp {last_ts:.1f}s")
-        # ------------------
-
-        return segments or None
-    except Exception:
-        logger.error(f"RapidAPI transcript fetch failed for {video_id} (lang={lang}):\n{traceback.format_exc()}")
-        return None
-
-
 
 
 @app.post("/webhook/{secret}")
