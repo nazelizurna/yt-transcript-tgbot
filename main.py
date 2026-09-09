@@ -9,6 +9,10 @@ import requests
 from fastapi import FastAPI, Request, HTTPException
 from docx import Document
 from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("yt-transcript-bot")
@@ -297,17 +301,71 @@ def format_timestamp(seconds: float) -> str:
     return f"[{m:02d}:{s:02d}]"
 
 
+from docx.shared import Pt, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+
+def _add_page_number_field(paragraph):
+    """Insert a PAGE field (auto page number) into a paragraph run."""
+    run = paragraph.add_run()
+    fldChar1 = OxmlElement('w:fldChar')
+    fldChar1.set(qn('w:fldCharType'), 'begin')
+
+    instrText = OxmlElement('w:instrText')
+    instrText.set(qn('xml:space'), 'preserve')
+    instrText.text = "PAGE"
+
+    fldChar2 = OxmlElement('w:fldChar')
+    fldChar2.set(qn('w:fldCharType'), 'end')
+
+    run._r.append(fldChar1)
+    run._r.append(instrText)
+    run._r.append(fldChar2)
+
+
 def build_docx(video_id: str, segments: list) -> str:
     doc = Document()
+
+    # 0.5" margins all around
+    for section in doc.sections:
+        section.top_margin = Inches(0.5)
+        section.bottom_margin = Inches(0.5)
+        section.left_margin = Inches(0.5)
+        section.right_margin = Inches(0.5)
+
+        # Page number in bottom-right corner (footer)
+        footer = section.footer
+        footer_para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+        footer_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        footer_para.text = ""
+        _add_page_number_field(footer_para)
+
+    # Set default font to Times New Roman 14pt
+    style = doc.styles["Normal"]
+    style.font.name = "Times New Roman"
+    style.font.size = Pt(14)
+    # Ensure east-asian font mapping doesn't override it
+    rPr = style.element.get_or_add_rPr()
+    rFonts = rPr.find(qn('w:rFonts'))
+    if rFonts is None:
+        rFonts = OxmlElement('w:rFonts')
+        rPr.append(rFonts)
+    rFonts.set(qn('w:ascii'), 'Times New Roman')
+    rFonts.set(qn('w:hAnsi'), 'Times New Roman')
+    rFonts.set(qn('w:eastAsia'), 'Times New Roman')
+
     doc.add_heading(f"YouTube Transcript - Video {video_id}", level=1)
 
-    for seg in segments:
-        p = doc.add_paragraph()
-        ts_run = p.add_run(format_timestamp(seg["start"]) + " ")
-        ts_run.bold = True
-        ts_run.font.size = Pt(11)
-        text_run = p.add_run(seg["text"])
-        text_run.font.size = Pt(11)
+    # No timestamps, no line breaks: join everything into one continuous paragraph
+    full_text = " ".join(seg["text"].strip() for seg in segments if seg.get("text"))
+    full_text = re.sub(r"\s+", " ", full_text).strip()
+
+    p = doc.add_paragraph()
+    run = p.add_run(full_text)
+    run.font.name = "Times New Roman"
+    run.font.size = Pt(14)
 
     fd, path = tempfile.mkstemp(suffix=".docx", dir="/tmp", prefix=f"{video_id}_")
     os.close(fd)
