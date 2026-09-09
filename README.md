@@ -6,7 +6,7 @@ Send the bot a YouTube link, get back a `.docx` file with the video's transcript
 
 1. User sends a YouTube URL to the bot (optionally followed by a language keyword, e.g. `eng`, `fr`).
 2. Bot extracts the video ID and fetches the transcript:
-   - **Primary:** [Supadata's YouTube Transcripts API](https://rapidapi.com/) via RapidAPI.
+   - **Primary:** [Supadata's YouTube Transcripts API](https://rapidapi.com/8v2FWW4H6AmKw89/api/youtube-transcripts via RapidAPI.
    - **Fallback:** `yt-dlp`, if the RapidAPI call fails or returns nothing.
 3. Transcript is written into a Word document (Times New Roman 14pt, justified body text, page numbers, video title as the first line) and sent back to the chat.
 4. Temp files are deleted after sending.
