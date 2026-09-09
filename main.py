@@ -389,21 +389,21 @@ def build_docx(video_id: str, segments: list, video_title: str) -> str:
     rFonts.set(qn('w:hAnsi'), 'Times New Roman')
     rFonts.set(qn('w:eastAsia'), 'Times New Roman')
 
-    # Title line (centered, bold) - the real (Russian) video title, replacing
+    # Title line (justified, bold) - the real (Russian) video title, replacing
     # the old "YouTube Transcript - Video ..." heading.
     title_para = doc.add_paragraph()
-    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     title_run = title_para.add_run(video_title)
     title_run.font.name = "Times New Roman"
     title_run.font.size = Pt(14)
     title_run.bold = True
 
-    # Transcript body: one continuous paragraph, centered, no timestamps/line breaks
+    # Transcript body: one continuous paragraph, justified, no timestamps/line breaks
     full_text = " ".join(seg["text"].strip() for seg in segments if seg.get("text"))
     full_text = re.sub(r"\s+", " ", full_text).strip()
 
     body_para = doc.add_paragraph()
-    body_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    body_para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     body_run = body_para.add_run(full_text)
     body_run.font.name = "Times New Roman"
     body_run.font.size = Pt(14)
