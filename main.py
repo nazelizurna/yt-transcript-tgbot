@@ -123,13 +123,52 @@ def _parse_json3(data: dict) -> list:
     return segments
 
 
-def fetch_transcript(video_id: str) -> Optional[list]:
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
+RAPIDAPI_HOST = "youtube-transcripts.p.rapidapi.com"  # confirm exact value from your RapidAPI code snippet
+RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/youtube/transcript"  # confirm exact path from your RapidAPI code snippet
+
+
+def fetch_transcript_rapidapi(video_id: str) -> Optional[list]:
     """
-    Uses yt-dlp (instead of youtube_transcript_api) to pull captions.
-    yt-dlp hits YouTube's innertube API rather than scraping the watch-page
-    HTML directly, which tends to be more resilient to the IP-blocking that
-    cloud providers (Render, AWS, etc.) run into with simpler scrapers.
+    Primary transcript source: Supadata's YouTube Transcripts API via RapidAPI.
+    Runs from Supadata's infrastructure, not Render's IP, so it sidesteps
+    the datacenter-IP block entirely.
     """
+    if not RAPIDAPI_KEY:
+        return None
+
+    try:
+        resp = requests.get(
+            RAPIDAPI_URL,
+            headers={
+                "X-RapidAPI-Key": RAPIDAPI_KEY,
+                "X-RapidAPI-Host": RAPIDAPI_HOST,
+            },
+            params={"url": f"https://www.youtube.com/watch?v={video_id}"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Supadata's response shape: {"lang": "en", "content": [{"text","offset","duration"}, ...]}
+        raw_segments = data.get("content") or data.get("transcript") or []
+        if not raw_segments:
+            return None
+
+        segments = [
+            {"start": seg["offset"] / 1000.0, "text": seg["text"]}
+            for seg in raw_segments
+            if seg.get("text")
+        ]
+        return segments or None
+
+    except Exception:
+        logger.error(f"RapidAPI transcript fetch failed for {video_id}:\n{traceback.format_exc()}")
+        return None
+
+
+def fetch_transcript_ytdlp(video_id: str) -> Optional[list]:
+    """Fallback: original yt-dlp method (kept as-is, renamed)."""
     try:
         import yt_dlp
 
@@ -190,8 +229,19 @@ def fetch_transcript(video_id: str) -> Optional[list]:
         return segments or None
 
     except Exception:
-        logger.error(f"Transcript fetch failed for {video_id}:\n{traceback.format_exc()}")
+        logger.error(f"yt-dlp transcript fetch failed for {video_id}:\n{traceback.format_exc()}")
         return None
+
+
+def fetch_transcript(video_id: str) -> Optional[list]:
+    """Try RapidAPI (Supadata) first — off-Render infra, dodges the IP block.
+    Fall back to yt-dlp only if RapidAPI fails or the free quota is exhausted."""
+    segments = fetch_transcript_rapidapi(video_id)
+    if segments:
+        return segments
+
+    logger.warning(f"RapidAPI transcript unavailable for {video_id}, falling back to yt-dlp")
+    return fetch_transcript_ytdlp(video_id)
 
 
 def format_timestamp(seconds: float) -> str:
