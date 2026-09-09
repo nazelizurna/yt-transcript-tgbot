@@ -1,8 +1,3 @@
-"""
-YouTube Transcript -> Telegram Document Bot (Webhook Architecture)
-====================================================================
-"""
-
 import os
 import re
 import tempfile
@@ -24,6 +19,12 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}"
 
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
+# Confirm these two values against the exact code snippet shown on your
+# RapidAPI endpoint page (Get Transcript -> Code Snippets -> Python -> Requests).
+RAPIDAPI_HOST = os.environ.get("RAPIDAPI_HOST", "youtube-transcripts.p.rapidapi.com")
+RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/youtube/transcript"
+
 YOUTUBE_ID_PATTERNS = [
     r"(?:youtube\.com/watch\?v=)([A-Za-z0-9_-]{11})",
     r"(?:youtube\.com/shorts/)([A-Za-z0-9_-]{11})",
@@ -31,6 +32,25 @@ YOUTUBE_ID_PATTERNS = [
     r"(?:youtu\.be/)([A-Za-z0-9_-]{11})",
     r"(?:m\.youtube\.com/watch\?v=)([A-Za-z0-9_-]{11})",
 ]
+
+# --- Language handling ---------------------------------------------------
+
+DEFAULT_LANG = "ru"
+
+LANG_KEYWORDS = {
+    "eng": "en",
+    "english": "en",
+    "en": "en",
+    "fr": "fr",
+    "french": "fr",
+    "francais": "fr",
+    "français": "fr",
+}
+
+# Simple in-memory cache, keyed by "<video_id>:<lang>". Resets on every
+# restart/redeploy - fine for a low-traffic bot, but say the word if you
+# want this backed by a small SQLite file instead so it survives restarts.
+_transcript_cache = {}
 
 
 def extract_video_id(text: str) -> Optional[str]:
@@ -42,6 +62,18 @@ def extract_video_id(text: str) -> Optional[str]:
             return match.group(1)
     return None
 
+
+def extract_lang_override(text: str, video_id: str) -> str:
+    """Look for a trailing language keyword in the message, e.g.
+    'https://youtu.be/FKiIzaHyIcs eng'. Defaults to Russian if none found."""
+    remainder = text.replace(video_id, "").strip().lower()
+    for keyword, lang_code in LANG_KEYWORDS.items():
+        if re.search(rf"\b{keyword}\b", remainder):
+            return lang_code
+    return DEFAULT_LANG
+
+
+# --- Telegram helpers ------------------------------------------------------
 
 def tg_call(method: str, **kwargs):
     if not TELEGRAM_BOT_TOKEN:
@@ -75,6 +107,8 @@ def send_document(chat_id: int, file_path: str, caption: str) -> None:
     with open(file_path, "rb") as f:
         tg_call("sendDocument", chat_id=chat_id, caption=caption, files={"document": f})
 
+
+# --- Caption parsing (yt-dlp fallback path) --------------------------------
 
 def _parse_vtt(vtt_text: str) -> list:
     """Parse a WEBVTT subtitle file into [{start, text}, ...] segments."""
@@ -123,16 +157,13 @@ def _parse_json3(data: dict) -> list:
     return segments
 
 
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
-RAPIDAPI_HOST = "youtube-transcripts.p.rapidapi.com"  # confirm exact value from your RapidAPI code snippet
-RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/youtube/transcript"  # confirm exact path from your RapidAPI code snippet
+# --- Transcript sources ------------------------------------------------
 
-
-def fetch_transcript_rapidapi(video_id: str) -> Optional[list]:
+def fetch_transcript_rapidapi(video_id: str, lang: str = DEFAULT_LANG) -> Optional[list]:
     """
     Primary transcript source: Supadata's YouTube Transcripts API via RapidAPI.
     Runs from Supadata's infrastructure, not Render's IP, so it sidesteps
-    the datacenter-IP block entirely.
+    the datacenter-IP block yt-dlp hits directly.
     """
     if not RAPIDAPI_KEY:
         return None
@@ -144,7 +175,10 @@ def fetch_transcript_rapidapi(video_id: str) -> Optional[list]:
                 "X-RapidAPI-Key": RAPIDAPI_KEY,
                 "X-RapidAPI-Host": RAPIDAPI_HOST,
             },
-            params={"url": f"https://www.youtube.com/watch?v={video_id}"},
+            params={
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "lang": lang,
+            },
             timeout=30,
         )
         resp.raise_for_status()
@@ -163,12 +197,18 @@ def fetch_transcript_rapidapi(video_id: str) -> Optional[list]:
         return segments or None
 
     except Exception:
-        logger.error(f"RapidAPI transcript fetch failed for {video_id}:\n{traceback.format_exc()}")
+        logger.error(f"RapidAPI transcript fetch failed for {video_id} (lang={lang}):\n{traceback.format_exc()}")
         return None
 
 
 def fetch_transcript_ytdlp(video_id: str) -> Optional[list]:
-    """Fallback: original yt-dlp method (kept as-is, renamed)."""
+    """
+    Fallback transcript source. Uses yt-dlp directly against YouTube, which
+    is prone to being blocked from cloud IPs (Render, AWS, etc.) with
+    'Sign in to confirm you're not a bot'. Does not support the language
+    override - grabs whatever caption track is available per the
+    preferred_langs order below.
+    """
     try:
         import yt_dlp
 
@@ -189,7 +229,7 @@ def fetch_transcript_ytdlp(video_id: str) -> Optional[list]:
         auto_subs = info.get("automatic_captions") or {}
 
         preferred_langs = [
-            "en", "en-US", "en-GB", "ru", "es", "pt", "fr", "de",
+            "ru", "en", "en-US", "en-GB", "es", "pt", "fr", "de",
             "hi", "id", "ar", "ja", "ko", "zh-Hans", "zh-Hant", "it", "tr", "vi",
         ]
 
@@ -233,15 +273,19 @@ def fetch_transcript_ytdlp(video_id: str) -> Optional[list]:
         return None
 
 
-def fetch_transcript(video_id: str) -> Optional[list]:
-    """Try RapidAPI (Supadata) first — off-Render infra, dodges the IP block.
-    Fall back to yt-dlp only if RapidAPI fails or the free quota is exhausted."""
-    segments = fetch_transcript_rapidapi(video_id)
-    if segments:
-        return segments
+def fetch_transcript(video_id: str, lang: str = DEFAULT_LANG) -> Optional[list]:
+    cache_key = f"{video_id}:{lang}"
+    if cache_key in _transcript_cache:
+        return _transcript_cache[cache_key]
 
-    logger.warning(f"RapidAPI transcript unavailable for {video_id}, falling back to yt-dlp")
-    return fetch_transcript_ytdlp(video_id)
+    segments = fetch_transcript_rapidapi(video_id, lang=lang)
+    if not segments:
+        logger.warning(f"RapidAPI transcript unavailable for {video_id} (lang={lang}), falling back to yt-dlp")
+        segments = fetch_transcript_ytdlp(video_id)
+
+    if segments:
+        _transcript_cache[cache_key] = segments
+    return segments
 
 
 def format_timestamp(seconds: float) -> str:
@@ -284,17 +328,18 @@ def process_update(update: dict) -> None:
         send_message(chat_id, "❌ Please send a valid YouTube link.")
         return
 
+    lang = extract_lang_override(text, video_id)
     status_id = send_message(chat_id, "⏳ Extracting video transcript...")
 
     file_path = None
     try:
-        segments = fetch_transcript(video_id)
+        segments = fetch_transcript(video_id, lang=lang)
         if not segments:
             send_message(chat_id, "❌ Transcript unavailable for this video.")
             return
 
         file_path = build_docx(video_id, segments)
-        send_document(chat_id, file_path, caption=f"📄 File ready for Video ID: {video_id}")
+        send_document(chat_id, file_path, caption=f"📄 File ready for Video ID: {video_id} ({lang})")
     except Exception:
         logger.error(f"process_update failed for video {video_id}:\n{traceback.format_exc()}")
         send_message(chat_id, "❌ Something went wrong generating your transcript.")
@@ -343,6 +388,8 @@ async def debug():
         "token_set": bool(TELEGRAM_BOT_TOKEN),
         "token_length": len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0,
         "webhook_secret_set": bool(WEBHOOK_SECRET),
+        "rapidapi_key_set": bool(RAPIDAPI_KEY),
+        "rapidapi_host": RAPIDAPI_HOST,
     }
 
 
