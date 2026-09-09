@@ -408,6 +408,49 @@ def process_update(update: dict) -> None:
             os.remove(file_path)
 
 
+
+def fetch_transcript_rapidapi(video_id: str, lang: str = DEFAULT_LANG) -> Optional[list]:
+    if not RAPIDAPI_KEY:
+        return None
+    try:
+        resp = requests.get(
+            RAPIDAPI_URL,
+            headers={"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST},
+            params={"url": f"https://www.youtube.com/watch?v={video_id}", "lang": lang},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # --- TEMP DEBUG ---
+        logger.info(f"RapidAPI raw response keys: {list(data.keys())}")
+        logger.info(f"RapidAPI response size: {len(resp.text)} chars")
+        # ------------------
+
+        raw_segments = data.get("content") or data.get("transcript") or []
+        if not raw_segments:
+            return None
+
+        segments = [
+            {"start": seg["offset"] / 1000.0, "text": seg["text"]}
+            for seg in raw_segments
+            if seg.get("text")
+        ]
+
+        # --- TEMP DEBUG ---
+        total_chars = sum(len(s["text"]) for s in segments)
+        last_ts = segments[-1]["start"] if segments else 0
+        logger.info(f"Parsed {len(segments)} segments, {total_chars} total chars, last timestamp {last_ts:.1f}s")
+        # ------------------
+
+        return segments or None
+    except Exception:
+        logger.error(f"RapidAPI transcript fetch failed for {video_id} (lang={lang}):\n{traceback.format_exc()}")
+        return None
+
+
+
+
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
     # Never 500 on webhook secret mismatch checks or config issues —
