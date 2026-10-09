@@ -2,8 +2,6 @@
 
 Send a YouTube link, get a `.docx` transcript back. English transcripts are automatically translated to Russian.
 
-<img width="2088" height="2384" alt="image" src="https://github.com/user-attachments/assets/f969164b-7d17-4c67-b4d9-1ec91776b985" />
-
 ## How it works
 
 1. Send a YouTube URL to the bot, optionally followed by a language keyword (`eng`, `fr`).
