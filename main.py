@@ -7,7 +7,7 @@ import time
 from typing import Optional
 
 import requests
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -39,7 +39,7 @@ LLM_BASE_URL = os.environ.get(
     "LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"
 ).rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
-TRANSLATE_CHUNK_CHARS = 3000
+TRANSLATE_CHUNK_CHARS = 10000
 
 YOUTUBE_ID_PATTERNS = [
     r"(?:youtube\.com/watch\?v=)([A-Za-z0-9_-]{11})",
@@ -483,7 +483,7 @@ def _split_text(text: str, max_chars: int = TRANSLATE_CHUNK_CHARS) -> list:
     return chunks
 
 
-def _llm_translate_chunk(text: str, retries: int = 3) -> str:
+def _llm_translate_chunk(text: str, retries: int = 5) -> str:
     if not LLM_API_KEY:
         raise RuntimeError("LLM_API_KEY not configured")
 
@@ -519,8 +519,11 @@ def _llm_translate_chunk(text: str, retries: int = 3) -> str:
             raise RuntimeError("Empty translation returned")
         except Exception as e:
             last_error = e
-            logger.warning(f"Translation attempt {attempt + 1} failed: {e}")
-            time.sleep(3 * (attempt + 1))
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            # Rate limited (429): wait much longer before retrying
+            wait = 20 * (attempt + 1) if status == 429 else 3 * (attempt + 1)
+            logger.warning(f"Translation attempt {attempt + 1} failed: {e} (waiting {wait}s)")
+            time.sleep(wait)
     raise last_error
 
 
@@ -567,6 +570,7 @@ def process_update(update: dict) -> None:
                 lang = "en→ru"
             except Exception:
                 logger.error(f"Translation failed for {video_id}:\n{traceback.format_exc()}")
+                lang = "en, not translated"
                 send_message(chat_id, "⚠️ Translation failed, sending the original English text.")
 
         file_path = build_docx(video_id, segments, video_title)
@@ -581,8 +585,21 @@ def process_update(update: dict) -> None:
             os.remove(file_path)
 
 
+# Telegram re-sends an update if it doesn't get a reply quickly. Processing now
+# runs in the background (reply is instant), and update_ids already seen are
+# ignored as a second safety net against duplicates.
+_seen_update_ids = set()
+
+
+def _run_update(update: dict) -> None:
+    try:
+        process_update(update)
+    except Exception:
+        logger.error(f"Unhandled error in process_update:\n{traceback.format_exc()}")
+
+
 @app.post("/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request):
+async def telegram_webhook(secret: str, request: Request, background_tasks: BackgroundTasks):
     # Never 500 on webhook secret mismatch checks or config issues —
     # always return 200 so Telegram doesn't hammer retries, and log everything.
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -599,11 +616,16 @@ async def telegram_webhook(secret: str, request: Request):
         logger.error(f"Failed to parse incoming update as JSON:\n{traceback.format_exc()}")
         return {"ok": True}
 
-    try:
-        process_update(update)
-    except Exception:
-        logger.error(f"Unhandled error in process_update:\n{traceback.format_exc()}")
+    update_id = update.get("update_id")
+    if update_id is not None:
+        if update_id in _seen_update_ids:
+            logger.info(f"Ignoring duplicate update {update_id}")
+            return {"ok": True}
+        _seen_update_ids.add(update_id)
+        if len(_seen_update_ids) > 1000:
+            _seen_update_ids.clear()
 
+    background_tasks.add_task(_run_update, update)
     return {"ok": True}
 
 
