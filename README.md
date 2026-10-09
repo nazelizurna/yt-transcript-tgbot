@@ -1,47 +1,43 @@
 # YouTube Transcript Telegram Bot
 
-Send the bot a YouTube link, get back a `.docx` file with the video's transcript.
+Send a YouTube link, get a `.docx` transcript back. English transcripts are automatically translated to Russian.
+
+<img width="2088" height="2384" alt="image" src="https://github.com/user-attachments/assets/f969164b-7d17-4c67-b4d9-1ec91776b985" />
 
 ## How it works
 
-1. User sends a YouTube URL to the bot (optionally followed by a language keyword, e.g. `eng`, `fr`).
-2. Bot extracts the video ID and fetches the transcript:
-   - **Primary:** [Supadata's YouTube Transcripts API](https://rapidapi.com/ via [RapidAPI](https://rapidapi.com/8v2FWW4H6AmKw89/api/youtube-transcripts).
-   - **Fallback:** `yt-dlp`, if the RapidAPI call fails or returns nothing.
-3. Transcript is written into a Word document (Times New Roman 14pt, justified body text, page numbers, video title as the first line) and sent back to the chat.
-4. Temp files are deleted after sending.
+1. Send a YouTube URL to the bot, optionally followed by a language keyword (`eng`, `fr`).
+2. The bot fetches the transcript:
+   - **Primary:** [Supadata YouTube Transcripts API](https://rapidapi.com/8v2FWW4H6AmKw89/api/youtube-transcripts) via RapidAPI
+   - **Fallback:** `yt-dlp`
+3. If the transcript is English, it is translated to Russian with an OpenAI-compatible LLM API (default: Google Gemini). Russian transcripts are left as is.
+4. The transcript is written to a `.docx` (Times New Roman 14pt, justified, page numbers, video title on top) and sent to the chat.
 
-Default transcript language is Russian (`ru`). Supported overrides: `en`/`eng`/`english`, `fr`/`french`/`francais`/`français`.
-
-## Requirements
-
-- Python 3.10+
-- A Telegram bot token ([@BotFather](https://t.me/BotFather))
-- A RapidAPI key subscribed to the YouTube Transcripts endpoint
+Default language is Russian (`ru`). Overrides: `en`/`eng`/`english`, `fr`/`french`/`francais`/`français`.
 
 ## Environment variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | yes | Bot token from BotFather |
-| `WEBHOOK_SECRET` | recommended | Secret path segment for the webhook URL, e.g. `/webhook/<secret>` |
-| `RAPIDAPI_KEY` | yes (for primary source) | RapidAPI key |
-| `RAPIDAPI_HOST` | no | Defaults to `youtube-transcripts.p.rapidapi.com` |
-| `PORT` | no | Defaults to `8000` |
+| `TELEGRAM_BOT_TOKEN` | yes | Token from [@BotFather](https://t.me/BotFather) |
+| `WEBHOOK_SECRET` | recommended | Secret path segment: `/webhook/<secret>` |
+| `RAPIDAPI_KEY` | yes | RapidAPI key |
+| `RAPIDAPI_HOST` | no | Default: `youtube-transcripts.p.rapidapi.com` |
+| `LLM_API_KEY` | yes (for translation) | API key, e.g. from [Google AI Studio](https://aistudio.google.com/apikey) |
+| `LLM_MODEL` | no | Default: `gemini-2.5-flash`. For new Gemini keys use e.g. `gemini-3.5-flash-lite` |
+| `LLM_BASE_URL` | no | Default: `https://generativelanguage.googleapis.com/v1beta/openai` |
+| `PORT` | no | Default: `8000` |
+
+Other providers work via `LLM_BASE_URL` + `LLM_MODEL`, e.g. DeepSeek (`https://api.deepseek.com`, `deepseek-chat`) or Groq (`https://api.groq.com/openai/v1`, `llama-3.3-70b-versatile`).
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
-```
-
-Set the environment variables above, then run:
-
-```bash
 python main.py
 ```
 
-Register the webhook with Telegram:
+Register the webhook (HTTPS required):
 
 ```bash
 curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<your-domain>/webhook/<WEBHOOK_SECRET>"
@@ -49,17 +45,17 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<y
 
 ## Endpoints
 
-- `POST /webhook/{secret}` — Telegram webhook handler
-- `GET /` — health check
-- `GET /debug` — reports whether required env vars are set (no secret values exposed)
+- `POST /webhook/{secret}` – Telegram webhook (processing runs in the background)
+- `GET /` – health check
+- `GET /debug` – shows which env vars are set (no secret values)
 
 ## Deployment
 
-Built to run on [Render](https://render.com) or any host that can run a FastAPI app behind HTTPS (Telegram webhooks require HTTPS).
+Runs on [Render](https://render.com) or any host that serves a FastAPI app over HTTPS.
 
 ## Notes
 
-- `yt-dlp` calls can get blocked by YouTube from datacenter IPs (Render, AWS, etc.) — this is why the RapidAPI source is primary and `yt-dlp` is just the fallback.
-- Transcript results are cached in memory per `video_id:lang`; the cache resets on restart.
-
-<img width="2088" height="2384" alt="image" src="https://github.com/user-attachments/assets/f969164b-7d17-4c67-b4d9-1ec91776b985" />
+- `yt-dlp` is often blocked from datacenter IPs (Render, AWS), so RapidAPI is the primary source.
+- Transcripts are cached in memory per `video_id:lang`; the cache resets on restart.
+- Duplicate Telegram updates are ignored.
+- Free LLM tiers are rate limited; if translation fails, the original English `.docx` is sent.
