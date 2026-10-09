@@ -3,6 +3,7 @@ import re
 import tempfile
 import logging
 import traceback
+import time
 from typing import Optional
 
 import requests
@@ -28,6 +29,17 @@ RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 # RapidAPI endpoint page (Get Transcript -> Code Snippets -> Python -> Requests).
 RAPIDAPI_HOST = os.environ.get("RAPIDAPI_HOST", "youtube-transcripts.p.rapidapi.com")
 RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/youtube/transcript"
+
+# --- Translation API (any OpenAI-compatible endpoint) ----------------------
+# Defaults to Google Gemini's free tier. Get a key at https://aistudio.google.com/apikey
+# Other options: DeepSeek  -> LLM_BASE_URL=https://api.deepseek.com , LLM_MODEL=deepseek-chat
+#                Groq      -> LLM_BASE_URL=https://api.groq.com/openai/v1 , LLM_MODEL=llama-3.3-70b-versatile
+LLM_API_KEY = os.environ.get("LLM_API_KEY")
+LLM_BASE_URL = os.environ.get(
+    "LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"
+).rstrip("/")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+TRANSLATE_CHUNK_CHARS = 3000
 
 YOUTUBE_ID_PATTERNS = [
     r"(?:youtube\.com/watch\?v=)([A-Za-z0-9_-]{11})",
@@ -414,6 +426,110 @@ def build_docx(video_id: str, segments: list, video_title: str) -> str:
     return path
 
 
+# --- English detection + translation to Russian ----------------------------
+
+_ENGLISH_STOPWORDS = {
+    "the", "and", "is", "are", "was", "were", "to", "of", "in", "that", "it",
+    "you", "for", "with", "this", "have", "has", "be", "but", "not", "we",
+    "they", "he", "she", "i", "my", "your", "so", "what", "can", "will",
+    "just", "like", "there", "about", "if", "do", "going", "think", "know",
+}
+
+
+def is_english_text(text: str) -> bool:
+    """Heuristic: mostly Latin letters AND a high share of common English words.
+    Russian (Cyrillic) text and other Latin-script languages (e.g. French)
+    return False."""
+    sample = text[:20000]
+    cyrillic = len(re.findall(r"[А-Яа-яЁё]", sample))
+    latin = len(re.findall(r"[A-Za-z]", sample))
+    total_letters = cyrillic + latin
+    if total_letters < 20:
+        return False
+    if cyrillic / total_letters > 0.3:
+        return False
+    words = re.findall(r"[a-z']+", sample.lower())
+    if not words:
+        return False
+    hits = sum(1 for w in words if w in _ENGLISH_STOPWORDS)
+    return hits / len(words) >= 0.15
+
+
+def _split_text(text: str, max_chars: int = TRANSLATE_CHUNK_CHARS) -> list:
+    """Split text into chunks <= max_chars, preferring sentence boundaries.
+    Auto-captions often have no punctuation, so very long 'sentences' are
+    split on word boundaries."""
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks, current = [], ""
+    for sentence in sentences:
+        while len(sentence) > max_chars:
+            cut = sentence.rfind(" ", 0, max_chars)
+            if cut <= 0:
+                cut = max_chars
+            piece, sentence = sentence[:cut], sentence[cut:].lstrip()
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(piece)
+        if not sentence:
+            continue
+        if current and len(current) + 1 + len(sentence) > max_chars:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _llm_translate_chunk(text: str, retries: int = 3) -> str:
+    if not LLM_API_KEY:
+        raise RuntimeError("LLM_API_KEY not configured")
+
+    last_error = None
+    for attempt in range(retries):
+        try:
+            resp = requests.post(
+                f"{LLM_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                json={
+                    "model": LLM_MODEL,
+                    "temperature": 0.2,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a professional English-to-Russian translator. "
+                                "Translate the user's text into natural, accurate Russian. "
+                                "The text is a part of a video transcript. "
+                                "Output ONLY the translation as plain continuous text, "
+                                "with no comments, notes, headings or quotation marks added."
+                            ),
+                        },
+                        {"role": "user", "content": text},
+                    ],
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            if content and content.strip():
+                return content.strip()
+            raise RuntimeError("Empty translation returned")
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Translation attempt {attempt + 1} failed: {e}")
+            time.sleep(3 * (attempt + 1))
+    raise last_error
+
+
+def translate_to_russian(text: str) -> str:
+    chunks = _split_text(text)
+    logger.info(f"Translating {len(text)} chars in {len(chunks)} chunks")
+    return " ".join(_llm_translate_chunk(chunk) for chunk in chunks)
+
+
 def process_update(update: dict) -> None:
     message = update.get("message") or update.get("edited_message")
     if not message:
@@ -438,6 +554,21 @@ def process_update(update: dict) -> None:
             return
 
         video_title = fetch_video_title(video_id)
+
+        # If the transcript is English, translate it (and the title) to Russian.
+        # Russian transcripts are left untouched.
+        transcript_text = " ".join(seg["text"] for seg in segments if seg.get("text"))
+        if is_english_text(transcript_text):
+            try:
+                translated = translate_to_russian(re.sub(r"\s+", " ", transcript_text).strip())
+                segments = [{"start": segments[0]["start"], "text": translated}]
+                if is_english_text(video_title):
+                    video_title = translate_to_russian(video_title)
+                lang = "en→ru"
+            except Exception:
+                logger.error(f"Translation failed for {video_id}:\n{traceback.format_exc()}")
+                send_message(chat_id, "⚠️ Translation failed, sending the original English text.")
+
         file_path = build_docx(video_id, segments, video_title)
         send_document(chat_id, file_path, caption=f"📄 File ready for Video ID: {video_id} ({lang})")
     except Exception:
